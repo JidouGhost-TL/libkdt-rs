@@ -1,0 +1,23 @@
+[package]
+name = "libkdt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/JidouGhost-TL/libkdt-rs"
+description = "Standalone pure-Rust Konami PlayStation KDT/KDT1/MDT1 sequencer built on libspu2"
+keywords = ["ps1", "kdt", "konami", "sequencer", "spu"]
+categories = ["multimedia::audio", "emulators", "no-std"]
+
+[features]
+default = ["std"]
+std = ["alloc", "libspu2/std"]
+alloc = []
+
+[dependencies]
+libspu2 = { version = "0.2", path = "../libspu2-rs", default-features = false }
+
+[[bench]]
+name = "bench_audio"
+harness = false
