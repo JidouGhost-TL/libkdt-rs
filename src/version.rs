@@ -2,15 +2,9 @@
 
 //! Konami KDT sequence variants, hardware timer rates, and version detection.
 //!
-//! The variant set and header geometry were verified against Ghidra
-//! decompilations of the shared Konami Computer Entertainment (KCE) PS1 sound
-//! driver found in *Suikoden II* (`SLUS-00958`, accepts `KDT `/`KDT1`) and
-//! *Vandal Hearts II* (`SLUS-00940`, accepts `KDT `/`KDT1`/`MDT1` alongside
-//! PsyQ `pSEQ` and Standard MIDI `MThd`). Both titles program Root Counter 2
-//! with `SetRCnt(0xF2000002, 0x1CA0, 0x1000)`, i.e. target `7328` on the
-//! `4,233,600 Hz` counter clock. `MDT2` appears only as a data-file extension
-//! string in *Vandal Hearts II*; no decompiled loader accepts an `MDT2`
-//! header magic, so it is not a distinct variant.
+//! The KCE PS1 sound driver accepts `"KDT "`, `"KDT1"`, and `"MDT1"` sequence
+//! containers and programs Root Counter 2 with target `0x1CA0` (`7328`) on the
+//! `4,233,600 Hz` counter clock (`SysClk / 8`).
 
 use crate::{Error, Result};
 

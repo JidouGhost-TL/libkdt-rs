@@ -6,10 +6,7 @@
 //! `#![no_std]` environments without `alloc`. With the `alloc` feature
 //! enabled, [`KdtSequence`] provides an owned, fully decoded representation.
 //!
-//! Header and opcode grammar verified against the KCE driver track parser
-//! (`FUN_800e31bc`), header setup (`FUN_800e25c8`/`FUN_800e3620`), and step
-//! function (`FUN_800e38a4`) in *Vandal Hearts II* (`SLUS-00940`), cross-checked
-//! against *Suikoden II* (`SLUS-00958`):
+//! Header and opcode grammar:
 //!
 //! - Header (`16` bytes): magic, `data_size: u32le`, `ppqn: u16le`,
 //!   `reserved0: u16le`, `track_count: u16le`, `reserved1: u16le`.
@@ -461,7 +458,7 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
 /// Normalizes a raw KDT VLQ tick delta from header `ppqn` to the internal
 /// 120 PPQN timebase using a per-track fractional remainder accumulator (`rem`).
 ///
-/// Mirrors the KCE PlayStation 1 driver routine (`FUN_800e3474`):
+/// Scaling ratios for standard KCE PlayStation 1 PPQN values:
 /// - `48` (`0x30`): `(delta * 10 + rem) >> 2`, `rem = & 3`
 /// - `96` (`0x60`): `(delta * 5 + rem) >> 2`, `rem = & 3`
 /// - `192` (`0xC0`) / `240` (`0xF0`): `(delta + rem) >> 1`, `rem = & 1`

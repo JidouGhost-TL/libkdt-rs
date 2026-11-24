@@ -845,7 +845,7 @@ impl KdtPlayer {
             if self.tracks[track_idx].finished {
                 continue;
             }
-            // Per-track 8-bit fractional tempo accumulator (FUN_800e38a4).
+            // Per-track 8-bit fractional tempo accumulator.
             let acc = self.tracks[track_idx]
                 .tempo_acc
                 .saturating_add(self.tracks[track_idx].tempo);

@@ -9,7 +9,7 @@ use libkdt::{
 use libspu2::registers::ps1;
 
 // ---------------------------------------------------------------------------
-// Synthetic asset builders (Ghidra-verified KDT grammar)
+// Synthetic asset builders (KDT grammar)
 // ---------------------------------------------------------------------------
 
 fn build_kdt_bytes(magic: [u8; 4], ppqn: u16, streams: &[&[u8]]) -> Vec<u8> {
