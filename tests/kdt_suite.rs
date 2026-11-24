@@ -133,7 +133,7 @@ fn parses_all_three_variants_and_decodes_compact_events() {
         0x00, // lead delta 0
         0xC6, 0x82, // ChannelSelect(2), zero-delta
         0xC7, 0xFF, // Tempo(256), zero-delta
-        0xC8, 0x81, // BankParam(1), zero-delta
+        0xC8, 0x81, // PitchBend(1), zero-delta
         0xC9, 0x83, // ProgramChange(3), zero-delta
         0x87, 0xE4, // CC7 = 100, zero-delta
         60, 127, 24, // NoteOn(60, 127), delta 24
@@ -152,7 +152,7 @@ fn parses_all_three_variants_and_decodes_compact_events() {
             delta: 0,
         },
         KdtEvent {
-            command: KdtCommand::BankParam(1),
+            command: KdtCommand::PitchBend(1),
             delta: 0,
         },
         KdtEvent {

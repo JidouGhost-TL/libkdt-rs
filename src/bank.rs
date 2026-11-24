@@ -510,3 +510,42 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 3],
     ])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_std_vab_bank_view_parses_tables() {
+        const TABLE_BYTES: usize = 32 + 128 * 16 + 16 * 32 + 256 * 2;
+        let mut vh = [0u8; TABLE_BYTES];
+        vh[0..4].copy_from_slice(&VAB_MAGIC);
+        vh[4..8].copy_from_slice(&7u32.to_le_bytes());
+        vh[18..20].copy_from_slice(&1u16.to_le_bytes());
+        vh[20..22].copy_from_slice(&1u16.to_le_bytes());
+        vh[22..24].copy_from_slice(&1u16.to_le_bytes());
+        vh[24] = 127;
+        vh[25] = 64;
+        vh[32] = 1;
+        vh[33] = 100;
+        vh[34] = 8;
+        vh[36] = 64;
+        let tone_off = 32 + 128 * 16;
+        vh[tone_off + 2] = 120;
+        vh[tone_off + 3] = 64;
+        vh[tone_off + 4] = 60;
+        vh[tone_off + 7] = 127;
+        vh[tone_off + 22..tone_off + 24].copy_from_slice(&1i16.to_le_bytes());
+        let sizes_off = tone_off + 16 * 32;
+        vh[sizes_off + 2..sizes_off + 4].copy_from_slice(&2u16.to_le_bytes()); // 16 bytes
+        let vb = [0u8; 16];
+
+        let view = VabBankView::parse_vh_vb(&vh, &vb).unwrap();
+        assert_eq!(view.header.program_count, 1);
+        assert_eq!(view.program(0).unwrap().master_volume, 100);
+        assert_eq!(view.tone(0, 0).unwrap().volume, 120);
+        assert_eq!(view.block_for_program(0), Some(0));
+        assert_eq!(view.vag_body(1).unwrap().len(), 16);
+        assert!(view.vag_body(2).is_none());
+    }
+}

@@ -23,7 +23,9 @@ pub use bank::{VabBank, VabUpload};
 #[cfg(feature = "alloc")]
 pub use player::{ChannelSnapshot, KdtPlayer, RenderConfig, RenderResult};
 pub use reverb::{ReverbParams, ReverbPreset};
-pub use sequence::{KdtCommand, KdtEvent, KdtSequenceView, KdtTrackView, TrackEventIter};
+pub use sequence::{
+    normalize_ppqn_delta, KdtCommand, KdtEvent, KdtSequenceView, KdtTrackView, TrackEventIter,
+};
 #[cfg(feature = "alloc")]
 pub use sequence::{KdtSequence, KdtTrack};
 pub use version::{detect_version, KdtVersion, KDT_RC2_CLOCK_HZ, KDT_RC2_DIVIDER, KDT_TIMER_HZ};

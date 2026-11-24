@@ -30,7 +30,7 @@ pub const KDT_HEADER_BYTES: usize = 16;
 pub const KDT_LEGACY_DATA_OFFSET: usize = 0x50;
 
 /// Supported Konami PlayStation 1 KDT sequence container variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KdtVersion {
     /// Original `"KDT "` container (fixed `0x50` data start).
     Kdt,
@@ -113,4 +113,23 @@ pub fn detect_version(bytes: &[u8]) -> Result<KdtVersion> {
     }
     let magic: [u8; 4] = [bytes[0], bytes[1], bytes[2], bytes[3]];
     KdtVersion::from_magic(magic).ok_or(Error::UnknownVersion)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_std_version_ordering_and_geometry() {
+        assert!(KdtVersion::Kdt < KdtVersion::Kdt1);
+        assert!(KdtVersion::Kdt1 < KdtVersion::Mdt1);
+        assert_eq!(KdtVersion::Kdt.magic(), *b"KDT ");
+        assert_eq!(KdtVersion::Kdt1.as_str(), "KDT1");
+        assert_eq!(KdtVersion::Mdt1.data_offset(3), 22);
+        assert_eq!(KdtVersion::Kdt.data_offset(3), 0x50);
+        assert_eq!(detect_version(b"KDT1"), Ok(KdtVersion::Kdt1));
+        assert_eq!(detect_version(b"MDT1"), Ok(KdtVersion::Mdt1));
+        assert_eq!(detect_version(b"NOPE"), Err(Error::UnknownVersion));
+        assert!(detect_version(b"KD").is_err());
+    }
 }

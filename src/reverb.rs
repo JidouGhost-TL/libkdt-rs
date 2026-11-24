@@ -3,7 +3,7 @@
 //! PlayStation 1 SPU hardware reverb presets and register parameter blocks.
 
 /// The 10 standard PlayStation 1 SPU hardware reverb presets (`0..=9`).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReverbPreset {
     /// Reverb disabled (`0` bytes work area).
     #[default]
@@ -544,5 +544,25 @@ impl ReverbParams {
             self.v_lin as u16,
             self.v_rin as u16,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_std_reverb_preset_ordering_and_registers() {
+        for (idx, &preset) in ReverbPreset::ALL.iter().enumerate() {
+            assert_eq!(ReverbPreset::from_index(idx as u8), Some(preset));
+            if idx > 0 {
+                assert!(ReverbPreset::ALL[idx - 1] < preset);
+                assert!(preset.work_area_size() > 0);
+            }
+        }
+        assert_eq!(ReverbPreset::Off.work_area_size(), 0);
+        assert_eq!(ReverbPreset::Off.params().to_ps1_registers(), [0u16; 32]);
+        assert_eq!(ReverbPreset::Hall.params().to_ps1_registers()[0], 0x01A5);
+        assert_eq!(ReverbPreset::from_index(10), None);
     }
 }

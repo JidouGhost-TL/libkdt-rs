@@ -18,8 +18,9 @@ Header fields: `data_size: u32le` (`+0x04`), `ppqn: u16le` (`+0x08`),
 `track_count: u16le` (`+0x0C`). Track streams are compact MIDI-like:
 `[VLQ lead delta] (event [VLQ delta])*`, where an event's final parameter
 byte carries an MSB `0x80` zero-delta continuation flag. Opcodes: notes
-(`< 0x80`), channel select `0x46`, tempo `0x47` (`(val & 0x7F) * 2 + 2`),
-bank `0x48`, program `0x49`, running-note off `0x4A`/`0x4B`, CC pass-through,
+(`< 0x80`), channel select `0x46`, global tempo `0x47` (`(val & 0x7F) * 2 + 2`),
+pitch bend `0x48` (7-bit centered at `64`), program `0x49`, running-note off
+`0x4A`/`0x4B`, CC pass-through (including NRPN loop markers `CC 99` + `CC 6`),
 end-of-track `0x7F` (raw `0xFF`).
 
 Variant set, header geometry, opcode table, and timer verified against Ghidra

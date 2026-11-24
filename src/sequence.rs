@@ -42,10 +42,10 @@ pub enum KdtCommand {
     },
     /// Select logical channel (`0x46`, masked to `0..=15`).
     ChannelSelect(u8),
-    /// Set track tempo increment (`0x47`, `(val & 0x7F) * 2 + 2`, range `2..=256`).
+    /// Set sequence tempo increment across all tracks (`0x47`, `(val & 0x7F) * 2 + 2`, range `2..=256`).
     Tempo(u16),
-    /// Bank / parameter select (`0x48`).
-    BankParam(u8),
+    /// Pitch bend (`0x48`, 7-bit `0..=127`, centered at `64`).
+    PitchBend(u8),
     /// Program change (`0x49`).
     ProgramChange(u8),
     /// Running-note off (`0x4A` with VLQ delta / `0x4B` with zero delta).
@@ -180,7 +180,7 @@ impl Iterator for TrackEventIter<'_> {
                 let command = match cmd {
                     0x46 => KdtCommand::ChannelSelect(val & 0x0F),
                     0x47 => KdtCommand::Tempo(u16::from(val) * 2 + 2),
-                    0x48 => KdtCommand::BankParam(val),
+                    0x48 => KdtCommand::PitchBend(val),
                     _ => KdtCommand::ProgramChange(val),
                 };
                 Some(KdtEvent { command, delta })
@@ -456,4 +456,166 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
+}
+
+/// Normalizes a raw KDT VLQ tick delta from header `ppqn` to the internal
+/// 120 PPQN timebase using a per-track fractional remainder accumulator (`rem`).
+///
+/// Mirrors the KCE PlayStation 1 driver routine (`FUN_800e3474`):
+/// - `48` (`0x30`): `(delta * 10 + rem) >> 2`, `rem = & 3`
+/// - `96` (`0x60`): `(delta * 5 + rem) >> 2`, `rem = & 3`
+/// - `192` (`0xC0`) / `240` (`0xF0`): `(delta + rem) >> 1`, `rem = & 1`
+/// - `288` (`0x120`) / `360` (`0x168`): `(delta + rem) / 3`, `rem = % 3`
+/// - `384` (`0x180`) / `480` (`0x1E0`): `(delta + rem) >> 2`, `rem = & 3`
+/// - `768` (`0x300`) / `960` (`0x3C0`): `(delta + rem) >> 3`, `rem = & 7`
+/// - `120` or any other value: `delta` unchanged.
+#[inline]
+#[must_use]
+pub fn normalize_ppqn_delta(ppqn: u16, delta: u32, rem: &mut u32) -> u32 {
+    match ppqn {
+        48 => {
+            let v = u64::from(delta) * 10 + u64::from(*rem);
+            *rem = (v & 3) as u32;
+            (v >> 2).min(u64::from(u32::MAX)) as u32
+        }
+        96 => {
+            let v = u64::from(delta) * 5 + u64::from(*rem);
+            *rem = (v & 3) as u32;
+            (v >> 2).min(u64::from(u32::MAX)) as u32
+        }
+        192 | 240 => {
+            let v = u64::from(delta) + u64::from(*rem);
+            *rem = (v & 1) as u32;
+            (v >> 1) as u32
+        }
+        288 | 360 => {
+            let v = u64::from(delta) + u64::from(*rem);
+            *rem = (v % 3) as u32;
+            (v / 3) as u32
+        }
+        384 | 480 => {
+            let v = u64::from(delta) + u64::from(*rem);
+            *rem = (v & 3) as u32;
+            (v >> 2) as u32
+        }
+        768 | 960 => {
+            let v = u64::from(delta) + u64::from(*rem);
+            *rem = (v & 7) as u32;
+            (v >> 3) as u32
+        }
+        _ => delta,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_std_normalize_ppqn_delta_exact_ratios_and_remainders() {
+        // PPQN 48: 48 raw ticks -> 120 normalized ticks; fractional 1-tick steps accumulate cleanly.
+        let mut rem = 0;
+        assert_eq!(normalize_ppqn_delta(48, 48, &mut rem), 120);
+        assert_eq!(rem, 0);
+        let mut sum = 0;
+        for _ in 0..4 {
+            sum += normalize_ppqn_delta(48, 1, &mut rem);
+        }
+        assert_eq!(sum, 10); // 4 * 2.5 = 10
+        assert_eq!(rem, 0);
+
+        // PPQN 96: 96 -> 120; four 1-tick steps -> 5 ticks.
+        rem = 0;
+        assert_eq!(normalize_ppqn_delta(96, 96, &mut rem), 120);
+        sum = 0;
+        for _ in 0..4 {
+            sum += normalize_ppqn_delta(96, 1, &mut rem);
+        }
+        assert_eq!(sum, 5);
+        assert_eq!(rem, 0);
+
+        // PPQN 192 / 240: >> 1 with remainder.
+        rem = 0;
+        assert_eq!(normalize_ppqn_delta(240, 1, &mut rem), 0);
+        assert_eq!(rem, 1);
+        assert_eq!(normalize_ppqn_delta(240, 1, &mut rem), 1);
+        assert_eq!(rem, 0);
+        assert_eq!(normalize_ppqn_delta(192, 240, &mut rem), 120);
+
+        // PPQN 288 / 360: / 3 with remainder.
+        rem = 0;
+        assert_eq!(normalize_ppqn_delta(360, 1, &mut rem), 0);
+        assert_eq!(normalize_ppqn_delta(360, 1, &mut rem), 0);
+        assert_eq!(normalize_ppqn_delta(360, 1, &mut rem), 1);
+        assert_eq!(rem, 0);
+        assert_eq!(normalize_ppqn_delta(288, 360, &mut rem), 120);
+
+        // PPQN 384 / 480: >> 2 with remainder.
+        rem = 0;
+        assert_eq!(normalize_ppqn_delta(480, 480, &mut rem), 120);
+        assert_eq!(normalize_ppqn_delta(384, 3, &mut rem), 0);
+        assert_eq!(rem, 3);
+        assert_eq!(normalize_ppqn_delta(384, 1, &mut rem), 1);
+        assert_eq!(rem, 0);
+
+        // PPQN 768 / 960: >> 3 with remainder.
+        rem = 0;
+        assert_eq!(normalize_ppqn_delta(960, 960, &mut rem), 120);
+        assert_eq!(normalize_ppqn_delta(768, 7, &mut rem), 0);
+        assert_eq!(rem, 7);
+        assert_eq!(normalize_ppqn_delta(768, 1, &mut rem), 1);
+        assert_eq!(rem, 0);
+
+        // PPQN 120 and unknown pass through unchanged.
+        rem = 0;
+        assert_eq!(normalize_ppqn_delta(120, 37, &mut rem), 37);
+        assert_eq!(normalize_ppqn_delta(60, 37, &mut rem), 37);
+    }
+
+    #[test]
+    fn no_std_sequence_view_and_pitch_bend_decode() {
+        // Minimal KDT1 with 1 track: lead=0, PitchBend(96) zero-delta, NoteOn(60,100) delta=12, EndOfTrack.
+        const TRACK: [u8; 8] = [0x00, 0xC8, 0xE0, 60, 100, 12, 0xFF, 0x00];
+        let mut buf = [0u8; 18 + TRACK.len()];
+        let buf_len = buf.len() as u32;
+        buf[0..4].copy_from_slice(b"KDT1");
+        buf[4..8].copy_from_slice(&buf_len.to_le_bytes());
+        buf[8..10].copy_from_slice(&48u16.to_le_bytes());
+        buf[12..14].copy_from_slice(&1u16.to_le_bytes());
+        buf[16..18].copy_from_slice(&(TRACK.len() as u16).to_le_bytes());
+        buf[18..].copy_from_slice(&TRACK);
+
+        let view = KdtSequenceView::parse(&buf, None).unwrap();
+        assert_eq!(view.version, KdtVersion::Kdt1);
+        assert_eq!(view.ppqn, 48);
+        assert_eq!(view.track_count(), 1);
+        let track = view.track(0).unwrap();
+        assert_eq!(track.lead_delta(), 0);
+        let mut iter = track.events();
+        assert_eq!(
+            iter.next(),
+            Some(KdtEvent {
+                command: KdtCommand::PitchBend(96),
+                delta: 0
+            })
+        );
+        assert_eq!(
+            iter.next(),
+            Some(KdtEvent {
+                command: KdtCommand::NoteOn {
+                    key: 60,
+                    velocity: 100
+                },
+                delta: 12
+            })
+        );
+        assert_eq!(
+            iter.next(),
+            Some(KdtEvent {
+                command: KdtCommand::EndOfTrack,
+                delta: 0
+            })
+        );
+        assert_eq!(iter.next(), None);
+    }
 }

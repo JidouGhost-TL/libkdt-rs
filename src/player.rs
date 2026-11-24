@@ -10,15 +10,15 @@ use libspu2::{Device, StereoI16, VoiceState, PS1_RAM_SIZE, PS1_SAMPLE_RATE, VOIC
 
 use crate::bank::{ToneAttr, VabBank, VabUpload};
 use crate::reverb::{ReverbParams, ReverbPreset};
-use crate::sequence::{KdtCommand, KdtSequence};
+use crate::sequence::{normalize_ppqn_delta, KdtCommand, KdtSequence};
 use crate::version::{KDT_RC2_CLOCK_HZ, KDT_RC2_DIVIDER};
 use crate::{Error, Result};
 
 /// Number of logical MIDI-style channels (`16`).
 pub const MAX_CHANNELS: usize = 16;
 
-/// Default per-track tempo accumulator increment (`val = 63 => 128`).
-const DEFAULT_TEMPO: u16 = 128;
+/// Default per-track tempo accumulator increment (`0x68` = `104`).
+const DEFAULT_TEMPO: u16 = 0x68;
 
 /// VAB `ToneAttr::mode` bit indicating SPU hardware reverb send.
 const TONE_MODE_REVERB: u8 = 0x04;
@@ -59,6 +59,8 @@ pub struct RenderConfig {
     pub reverb_preset: ReverbPreset,
     /// SPU reverb return depth (`EVOLL`/`EVOLR`, default `0x2000`).
     pub reverb_depth: i16,
+    /// Root Counter 2 target divider (default `7_328` / `0x1CA0`; e.g. `7_168` / `0x1C00` on alternate titles).
+    pub timer_divider: u32,
 }
 
 impl RenderConfig {
@@ -76,6 +78,7 @@ impl RenderConfig {
             master_volume: 0x3FFF,
             reverb_preset: ReverbPreset::Off,
             reverb_depth: 0x2000,
+            timer_divider: KDT_RC2_DIVIDER,
         }
     }
 }
@@ -110,8 +113,8 @@ pub struct ChannelSnapshot {
     pub muted: bool,
     /// Current program (`0x49`) on this channel.
     pub program: u8,
-    /// Current bank (`0x48`) on this channel.
-    pub bank: u8,
+    /// Current 7-bit pitch bend (`0x48`, `0..=127`, `64` = center).
+    pub pitch_bend: u8,
     /// Current channel volume (CC7, `0..=127`).
     pub volume: u8,
     /// Current channel expression (CC11, `0..=127`).
@@ -133,7 +136,8 @@ pub struct ChannelSnapshot {
 #[derive(Debug, Clone, Copy)]
 struct ChannelState {
     program: u8,
-    bank: u8,
+    pitch_bend: u8,
+    nrpn_msb: u8,
     volume: u8,
     expression: u8,
     pan: u8,
@@ -146,7 +150,8 @@ impl Default for ChannelState {
     fn default() -> Self {
         Self {
             program: 0,
-            bank: 0,
+            pitch_bend: 64,
+            nrpn_msb: 0,
             volume: 127,
             expression: 127,
             pan: 64,
@@ -161,11 +166,21 @@ impl Default for ChannelState {
 struct TrackRuntime {
     event_index: usize,
     wait_ticks: u32,
+    rem: u32,
     tempo_acc: u16,
     tempo: u16,
     channel: usize,
     last_note: Option<u8>,
     finished: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackLoopSnapshot {
+    event_index: usize,
+    wait_ticks: u32,
+    rem: u32,
+    finished: bool,
+    last_note: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +192,7 @@ struct ActiveVoice {
     prog_mvol: u8,
     prog_mpan: u8,
     priority: u8,
+    pitch: u16,
     vol_l: i16,
     vol_r: i16,
     released: bool,
@@ -198,10 +214,15 @@ pub struct KdtPlayer {
     config: RenderConfig,
     device: Device,
     upload: VabUpload,
+    program_lut: [Option<usize>; 128],
     tracks: Vec<TrackRuntime>,
+    loop_snapshot: Option<Vec<TrackLoopSnapshot>>,
+    loop_count: u8,
     channels: [ChannelState; MAX_CHANNELS],
     voices: [Option<ActiveVoice>; VOICES_PER_CORE],
     voice_age: [u64; VOICES_PER_CORE],
+    eon_mask: u32,
+    eon_dirty: bool,
     mute_mask: u16,
     solo_mask: u16,
     reverb_active: bool,
@@ -246,6 +267,9 @@ impl KdtPlayer {
         if config.sample_rate == 0 {
             return Err(Error::InvalidArgument("sample_rate must be non-zero"));
         }
+        if config.timer_divider == 0 {
+            return Err(Error::InvalidArgument("timer_divider must be non-zero"));
+        }
         if config.fade_seconds < 0.0 || !config.fade_seconds.is_finite() {
             return Err(Error::InvalidArgument(
                 "fade_seconds must be non-negative and finite",
@@ -268,7 +292,24 @@ impl KdtPlayer {
         }
         let upload = bank.upload_to_spu(&mut device)?;
 
-        let samples_per_tick_num = u64::from(config.sample_rate) * u64::from(KDT_RC2_DIVIDER);
+        let mut program_lut = [None; 128];
+        let blocks = bank.tones.len() / 16;
+        for (slot, entry) in program_lut.iter_mut().enumerate() {
+            if slot >= bank.programs.len() {
+                break;
+            }
+            let mut found = None;
+            for block in 0..blocks {
+                let first = bank.tones[block * 16];
+                if first.program >= 0 && first.program as usize == slot {
+                    found = Some(block);
+                    break;
+                }
+            }
+            *entry = found.or_else(|| (slot < blocks).then_some(slot));
+        }
+
+        let samples_per_tick_num = u64::from(config.sample_rate) * u64::from(config.timer_divider);
         let samples_per_tick_den = u64::from(KDT_RC2_CLOCK_HZ);
         let fade_total_60hz = ((config.fade_seconds * 60.0) + 0.5) as u32;
         let max_frames = (config.max_seconds * f64::from(config.sample_rate)) as u64;
@@ -283,10 +324,15 @@ impl KdtPlayer {
             config,
             device,
             upload,
+            program_lut,
             tracks: Vec::new(),
+            loop_snapshot: None,
+            loop_count: 0x7F,
             channels: [ChannelState::default(); MAX_CHANNELS],
             voices: [None; VOICES_PER_CORE],
             voice_age: [0; VOICES_PER_CORE],
+            eon_mask: 0,
+            eon_dirty: false,
             mute_mask: 0,
             solo_mask: 0,
             reverb_active: false,
@@ -336,6 +382,10 @@ impl KdtPlayer {
         self.channels = [ChannelState::default(); MAX_CHANNELS];
         self.voices = [None; VOICES_PER_CORE];
         self.voice_age = [0; VOICES_PER_CORE];
+        self.eon_mask = 0;
+        self.eon_dirty = false;
+        self.loop_snapshot = None;
+        self.loop_count = 0x7F;
         self.timer_ticks = 0;
         self.sample_accum_num = 0;
         self.sequence_volume_fp16 = self.initial_sequence_volume_fp16;
@@ -352,19 +402,25 @@ impl KdtPlayer {
     }
 
     fn reset_tracks(&mut self) {
+        let ppqn = self.sequence.ppqn;
         self.tracks = self
             .sequence
             .tracks
             .iter()
             .enumerate()
-            .map(|(idx, track)| TrackRuntime {
-                event_index: 0,
-                wait_ticks: track.lead_delta,
-                tempo_acc: 0,
-                tempo: DEFAULT_TEMPO,
-                channel: idx % MAX_CHANNELS,
-                last_note: None,
-                finished: track.events.is_empty(),
+            .map(|(idx, track)| {
+                let mut rem = 0u32;
+                let wait_ticks = normalize_ppqn_delta(ppqn, track.lead_delta, &mut rem);
+                TrackRuntime {
+                    event_index: 0,
+                    wait_ticks,
+                    rem,
+                    tempo_acc: 0,
+                    tempo: DEFAULT_TEMPO,
+                    channel: idx % MAX_CHANNELS,
+                    last_note: None,
+                    finished: track.events.is_empty(),
+                }
             })
             .collect();
     }
@@ -569,7 +625,7 @@ impl KdtPlayer {
             active,
             muted: self.is_channel_effectively_muted(channel),
             program: ch.program,
-            bank: ch.bank,
+            pitch_bend: ch.pitch_bend,
             volume: ch.volume,
             expression: ch.expression,
             pan: ch.pan,
@@ -768,10 +824,10 @@ impl KdtPlayer {
 
     fn step_hardware_timer(&mut self) -> Result<()> {
         // 60 Hz fade-out tick: one step per 70,560 RC2 clock cycles
-        // (4,233,600 / 60), i.e. every ~9.63 Root Counter 2 ticks.
+        // (4,233,600 / 60).
         if self.phase == PlayPhase::Fading {
-            self.fade_accum_cycles += u64::from(KDT_RC2_DIVIDER);
-            if self.fade_accum_cycles >= 70_560 {
+            self.fade_accum_cycles += u64::from(self.config.timer_divider);
+            while self.fade_accum_cycles >= 70_560 {
                 self.fade_accum_cycles -= 70_560;
                 self.step_fade_60hz()?;
                 if self.phase != PlayPhase::Fading {
@@ -781,9 +837,11 @@ impl KdtPlayer {
             }
         }
 
+        let ppqn = self.sequence.ppqn;
         let mut kon_mask: u32 = 0;
         let mut koff_mask: u32 = 0;
-        for track_idx in 0..self.tracks.len() {
+        let mut loop_jumped = false;
+        'tracks: for track_idx in 0..self.tracks.len() {
             if self.tracks[track_idx].finished {
                 continue;
             }
@@ -808,15 +866,78 @@ impl KdtPlayer {
                     break;
                 };
                 self.tracks[track_idx].event_index += 1;
-                self.apply_command(track_idx, ev.command, &mut kon_mask, &mut koff_mask)?;
-                if ev.delta > 0 {
-                    self.tracks[track_idx].wait_ticks = ev.delta;
-                    break;
+                match ev.command {
+                    KdtCommand::ControlChange {
+                        controller: 99,
+                        value: 0x14,
+                    } => {
+                        let chan = self.tracks[track_idx].channel;
+                        self.channels[chan].nrpn_msb = 0x14;
+                        if ev.delta > 0 {
+                            self.tracks[track_idx].wait_ticks = normalize_ppqn_delta(
+                                ppqn,
+                                ev.delta,
+                                &mut self.tracks[track_idx].rem,
+                            );
+                        }
+                        self.snapshot_loop_start();
+                        if self.tracks[track_idx].wait_ticks > 0 {
+                            break;
+                        }
+                    }
+                    KdtCommand::ControlChange {
+                        controller: 99,
+                        value: 0x1E,
+                    } => {
+                        let chan = self.tracks[track_idx].channel;
+                        self.channels[chan].nrpn_msb = 0x1E;
+                        for ch in &mut self.channels {
+                            if ch.nrpn_msb == 0x14 {
+                                ch.nrpn_msb = 0;
+                            }
+                        }
+                        if self.handle_loop_end() {
+                            loop_jumped = true;
+                            break 'tracks;
+                        }
+                        if ev.delta > 0 {
+                            let wait = normalize_ppqn_delta(
+                                ppqn,
+                                ev.delta,
+                                &mut self.tracks[track_idx].rem,
+                            );
+                            if wait > 0 {
+                                self.tracks[track_idx].wait_ticks = wait;
+                                break;
+                            }
+                        }
+                    }
+                    cmd => {
+                        self.apply_command(track_idx, cmd, &mut kon_mask, &mut koff_mask)?;
+                        if ev.delta > 0 {
+                            let wait = normalize_ppqn_delta(
+                                ppqn,
+                                ev.delta,
+                                &mut self.tracks[track_idx].rem,
+                            );
+                            if wait > 0 {
+                                self.tracks[track_idx].wait_ticks = wait;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             if self.tracks[track_idx].wait_ticks > 0 {
                 self.tracks[track_idx].wait_ticks -= 1;
             }
+        }
+        if self.eon_dirty {
+            self.device
+                .write_ps1_register(ps1::EON_LO, (self.eon_mask & 0xFFFF) as u16)?;
+            self.device
+                .write_ps1_register(ps1::EON_HI, ((self.eon_mask >> 16) & 0xFF) as u16)?;
+            self.eon_dirty = false;
         }
         if koff_mask != 0 {
             self.device
@@ -832,7 +953,7 @@ impl KdtPlayer {
         }
         self.timer_ticks += 1;
 
-        if !self.tracks.is_empty() && self.tracks.iter().all(|t| t.finished) {
+        if !loop_jumped && !self.tracks.is_empty() && self.tracks.iter().all(|t| t.finished) {
             self.loops_completed = self.loops_completed.saturating_add(1);
             if self.phase == PlayPhase::Fading {
                 self.reset_tracks();
@@ -849,6 +970,63 @@ impl KdtPlayer {
             }
         }
         Ok(())
+    }
+
+    fn snapshot_loop_start(&mut self) {
+        let snap: Vec<TrackLoopSnapshot> = self
+            .tracks
+            .iter()
+            .map(|t| TrackLoopSnapshot {
+                event_index: t.event_index,
+                wait_ticks: t.wait_ticks,
+                rem: t.rem,
+                finished: t.finished,
+                last_note: t.last_note,
+            })
+            .collect();
+        self.loop_snapshot = Some(snap);
+        self.loop_count = 0x7F;
+    }
+
+    fn restore_loop_snapshot(&mut self) -> bool {
+        let Some(ref snap) = self.loop_snapshot else {
+            return false;
+        };
+        for (track, saved) in self.tracks.iter_mut().zip(snap.iter()) {
+            track.event_index = saved.event_index;
+            track.wait_ticks = saved.wait_ticks;
+            track.rem = saved.rem;
+            track.finished = saved.finished;
+            track.last_note = saved.last_note;
+        }
+        true
+    }
+
+    fn handle_loop_end(&mut self) -> bool {
+        if self.loop_snapshot.is_none() {
+            return false;
+        }
+        if self.loop_count == 0x7F {
+            self.loops_completed = self.loops_completed.saturating_add(1);
+            if self.phase == PlayPhase::Fading {
+                return self.restore_loop_snapshot();
+            }
+            if self.config.target_loops > 0 && self.loops_completed >= self.config.target_loops {
+                self.start_fade_out();
+                return self.restore_loop_snapshot();
+            }
+            if self.config.target_loops == 0 {
+                self.reached_end = true;
+                self.enter_tail();
+                return true;
+            }
+            return self.restore_loop_snapshot();
+        }
+        if self.loop_count > 0 {
+            self.loop_count -= 1;
+            return self.restore_loop_snapshot();
+        }
+        false
     }
 
     fn step_fade_60hz(&mut self) -> Result<()> {
@@ -914,11 +1092,15 @@ impl KdtPlayer {
                 self.tracks[track_idx].channel = usize::from(ch & 0x0F);
             }
             KdtCommand::Tempo(tempo) => {
-                self.tracks[track_idx].tempo = tempo.max(2);
+                let t = tempo.max(2);
+                for track in &mut self.tracks {
+                    track.tempo = t;
+                }
             }
-            KdtCommand::BankParam(bank) => {
+            KdtCommand::PitchBend(bend) => {
                 let chan = self.tracks[track_idx].channel;
-                self.channels[chan].bank = bank;
+                self.channels[chan].pitch_bend = bend & 0x7F;
+                self.refresh_channel_pitch(chan);
             }
             KdtCommand::ProgramChange(prog) => {
                 let chan = self.tracks[track_idx].channel;
@@ -943,6 +1125,11 @@ impl KdtPlayer {
 
     fn apply_cc(&mut self, chan: usize, cc: u8, val: u8, koff_mask: &mut u32) {
         match cc {
+            6 => {
+                if self.channels[chan].nrpn_msb == 0x14 {
+                    self.loop_count = val;
+                }
+            }
             7 => {
                 self.channels[chan].volume = val;
                 self.refresh_channel_voices(chan);
@@ -963,18 +1150,24 @@ impl KdtPlayer {
                     self.release_sustained(chan, koff_mask);
                 }
             }
+            99 => {
+                self.channels[chan].nrpn_msb = val;
+            }
             120 | 123 => {
                 self.release_channel(chan, koff_mask);
             }
             121 => {
                 self.channels[chan].expression = 127;
                 self.channels[chan].volume = 127;
+                self.channels[chan].pitch_bend = 64;
+                self.channels[chan].nrpn_msb = 0;
                 let was_down = self.channels[chan].sustain;
                 self.channels[chan].sustain = false;
                 if was_down {
                     self.release_sustained(chan, koff_mask);
                 }
                 self.refresh_channel_voices(chan);
+                self.refresh_channel_pitch(chan);
             }
             _ => {}
         }
@@ -986,6 +1179,13 @@ impl KdtPlayer {
             return Ok(());
         }
         let program = self.channels[chan].program as usize;
+        let Some(block) = self.program_lut.get(program).copied().flatten() else {
+            return Ok(());
+        };
+        let prog = self.bank.programs[program];
+        let prog_mvol = prog.master_volume;
+        let prog_mpan = prog.master_pan;
+
         // Resolve matching tones first so the bank borrow ends before
         // mutable voice allocation / register writes.
         let mut matched: [(ToneAttr, u32, u8); 16] = [(
@@ -1008,9 +1208,7 @@ impl KdtPlayer {
         ); 16];
         let mut matched_count = 0usize;
         {
-            let Some((prog, tones)) = self.bank.program_block(program) else {
-                return Ok(());
-            };
+            let tones = &self.bank.tones[block * 16..block * 16 + 16];
             let ntones = usize::from(prog.tones).min(16).min(tones.len());
             for tone in tones.iter().take(ntones) {
                 if key < tone.min || key > tone.max || tone.vag <= 0 {
@@ -1032,22 +1230,24 @@ impl KdtPlayer {
                 return Ok(());
             }
         }
-        let (prog_mvol, prog_mpan) = self
-            .bank
-            .program_block(program)
-            .map_or((127, 64), |(p, _)| (p.master_volume, p.master_pan));
         let ch = self.channels[chan];
         let bank_mvol = self.bank.header.master_volume;
-        let seq_gain = (self.sequence_volume_fp16 as f32) / (127.0 * 65536.0);
+        let seq_vol_fp16 = self.sequence_volume_fp16;
 
         for (tone, start_addr, priority) in matched.iter().take(matched_count) {
             let tone = *tone;
             let start_addr = *start_addr;
             let priority = *priority;
             let voice = self.allocate_voice(priority);
-            let pitch = pitch_reg(key, tone.center, tone.shift);
+            let pitch = pitch_reg(key, tone.center, tone.shift, ch.pitch_bend);
             let (vol_l, vol_r) = voice_volumes(
-                velocity, &tone, prog_mvol, prog_mpan, bank_mvol, ch, seq_gain,
+                velocity,
+                &tone,
+                prog_mvol,
+                prog_mpan,
+                bank_mvol,
+                ch,
+                seq_vol_fp16,
             );
             let reverb_send = self.reverb_active && ((tone.mode & TONE_MODE_REVERB) != 0);
             let base = (voice as u32) * ps1::VOICE_STRIDE;
@@ -1062,8 +1262,15 @@ impl KdtPlayer {
                 .write_ps1_register(base + ps1::V_VOLL, vol_l as u16)?;
             self.device
                 .write_ps1_register(base + ps1::V_VOLR, vol_r as u16)?;
-            if reverb_send {
-                self.set_eon(voice, true)?;
+            let bit = 1u32 << voice;
+            let next_eon = if reverb_send {
+                self.eon_mask | bit
+            } else {
+                self.eon_mask & !bit
+            };
+            if next_eon != self.eon_mask {
+                self.eon_mask = next_eon;
+                self.eon_dirty = true;
             }
             self.channels[chan].last_pitch = pitch;
             self.voices[voice] = Some(ActiveVoice {
@@ -1074,6 +1281,7 @@ impl KdtPlayer {
                 prog_mvol,
                 prog_mpan,
                 priority,
+                pitch,
                 vol_l,
                 vol_r,
                 released: false,
@@ -1152,31 +1360,31 @@ impl KdtPlayer {
         best
     }
 
-    fn set_eon(&mut self, voice: usize, on: bool) -> Result<()> {
-        if voice >= VOICES_PER_CORE {
-            return Ok(());
+    fn refresh_channel_pitch(&mut self, chan: usize) {
+        let pitch_bend = self.channels[chan].pitch_bend;
+        let mut last_pitch = None;
+        for (idx, entry) in self.voices.iter_mut().enumerate() {
+            let Some(v) = entry else { continue };
+            if v.channel != chan || v.released {
+                continue;
+            }
+            let pitch = pitch_reg(v.key, v.tone.center, v.tone.shift, pitch_bend);
+            if pitch != v.pitch {
+                let base = (idx as u32) * ps1::VOICE_STRIDE;
+                let _ = self.device.write_ps1_register(base + ps1::V_PITCH, pitch);
+                v.pitch = pitch;
+            }
+            last_pitch = Some(pitch);
         }
-        let (reg, bit) = if voice < 16 {
-            (ps1::EON_LO, voice as u16)
-        } else {
-            (ps1::EON_HI, (voice - 16) as u16)
-        };
-        let cur = self.device.read_ps1_register(reg)?;
-        let next = if on {
-            cur | (1u16 << bit)
-        } else {
-            cur & !(1u16 << bit)
-        };
-        if next != cur {
-            self.device.write_ps1_register(reg, next)?;
+        if let Some(pitch) = last_pitch {
+            self.channels[chan].last_pitch = pitch;
         }
-        Ok(())
     }
 
     fn refresh_channel_voices(&mut self, chan: usize) {
         let ch = self.channels[chan];
         let bank_mvol = self.bank.header.master_volume;
-        let seq_gain = (self.sequence_volume_fp16 as f32) / (127.0 * 65536.0);
+        let seq_vol_fp16 = self.sequence_volume_fp16;
         let muted = self.is_channel_effectively_muted(chan);
         for (idx, entry) in self.voices.iter_mut().enumerate() {
             let Some(v) = entry else { continue };
@@ -1190,7 +1398,7 @@ impl KdtPlayer {
                 v.prog_mpan,
                 bank_mvol,
                 ch,
-                seq_gain,
+                seq_vol_fp16,
             );
             if muted {
                 vol_l = 0;
@@ -1211,10 +1419,12 @@ impl KdtPlayer {
     }
 }
 
-/// Computes the PS1 SPU pitch register for `key` against tone center/shift
+/// Computes the PS1 SPU pitch register for `key` against tone center/shift and
+/// 7-bit channel pitch bend (`0..=127`, `64` = center, ±2 semitone range)
 /// using the 12-TET table with 1/128-semitone linear interpolation.
-fn pitch_reg(key: u8, center: u8, shift: u8) -> u16 {
-    let total_x128: i32 = (i32::from(key) - i32::from(center)) * 128 - i32::from(shift);
+fn pitch_reg(key: u8, center: u8, shift: u8, pitch_bend: u8) -> u16 {
+    let bend_x128 = (i32::from(pitch_bend) - 64) * 4;
+    let total_x128: i32 = (i32::from(key) - i32::from(center)) * 128 - i32::from(shift) + bend_x128;
     let semi = total_x128.div_euclid(128);
     let frac = total_x128.rem_euclid(128) as u32;
     let octave = semi.div_euclid(12);
@@ -1242,21 +1452,325 @@ fn voice_volumes(
     prog_mpan: u8,
     bank_mvol: u8,
     ch: ChannelState,
-    seq_gain: f32,
+    sequence_volume_fp16: u32,
 ) -> (i16, i16) {
-    let gain = (f32::from(velocity) / 127.0)
-        * (f32::from(tone.volume) / 127.0)
-        * (f32::from(prog_mvol) / 127.0)
-        * (f32::from(bank_mvol) / 127.0)
-        * (f32::from(ch.volume) / 127.0)
-        * (f32::from(ch.expression) / 127.0)
-        * seq_gain.clamp(0.0, 1.0);
+    const DIV_127_6: u64 = 127 * 127 * 127 * 127 * 127 * 127;
+    let prod = u64::from(velocity.min(127))
+        * u64::from(tone.volume.min(127))
+        * u64::from(prog_mvol.min(127))
+        * u64::from(bank_mvol.min(127))
+        * u64::from(ch.volume.min(127))
+        * u64::from(ch.expression.min(127));
+    let seq_scaled = (u64::from(sequence_volume_fp16.min(127 << 16)) * 16_383) / (127 << 16);
+    let base_vol = (prod * seq_scaled) / DIV_127_6;
     let pan = (i32::from(tone.pan) + (i32::from(ch.pan) - 64) + (i32::from(prog_mpan) - 64))
         .clamp(0, 127) as usize;
-    let pan_l = f32::from(PAN_SIN_LUT[127 - pan]) / 127.0;
-    let pan_r = f32::from(PAN_SIN_LUT[pan]) / 127.0;
-    (
-        (gain * pan_l * 16383.0) as i16,
-        (gain * pan_r * 16383.0) as i16,
-    )
+    let vol_l = ((base_vol * u64::from(PAN_SIN_LUT[127 - pan])) / 127) as i16;
+    let vol_r = ((base_vol * u64::from(PAN_SIN_LUT[pan])) / 127) as i16;
+    (vol_l, vol_r)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    fn build_kdt(ppqn: u16, streams: &[&[u8]]) -> KdtSequence {
+        let track_count = streams.len() as u16;
+        let data_offset = 16 + streams.len() * 2;
+        let total = data_offset + streams.iter().map(|s| s.len()).sum::<usize>();
+        let mut out = vec![0u8; total];
+        out[0..4].copy_from_slice(b"KDT1");
+        out[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+        out[8..10].copy_from_slice(&ppqn.to_le_bytes());
+        out[12..14].copy_from_slice(&track_count.to_le_bytes());
+        for (i, s) in streams.iter().enumerate() {
+            out[16 + i * 2..18 + i * 2].copy_from_slice(&(s.len() as u16).to_le_bytes());
+        }
+        let mut cur = data_offset;
+        for s in streams {
+            out[cur..cur + s.len()].copy_from_slice(s);
+            cur += s.len();
+        }
+        KdtSequence::parse(&out).unwrap()
+    }
+
+    fn build_vab(reverb_flags: &[u8]) -> VabBank {
+        let mut block = [0u8; 16];
+        block[1] = 0x03;
+        for (i, b) in block[2..].iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0x74 } else { 0x9B };
+        }
+        let bodies = [block; 8].concat();
+        let progs = reverb_flags.len() as u16;
+        let table_bytes = 32 + 128 * 16 + (progs as usize) * 16 * 32 + 256 * 2;
+        let mut out = vec![0u8; table_bytes + bodies.len()];
+        out[0..4].copy_from_slice(b"pBAV");
+        out[4..8].copy_from_slice(&7u32.to_le_bytes());
+        out[12..16].copy_from_slice(&((table_bytes + bodies.len()) as u32).to_le_bytes());
+        out[18..20].copy_from_slice(&progs.to_le_bytes());
+        out[20..22].copy_from_slice(&progs.to_le_bytes());
+        out[22..24].copy_from_slice(&1u16.to_le_bytes());
+        out[24] = 127;
+        out[25] = 64;
+        for (p, &mode) in reverb_flags.iter().enumerate() {
+            let po = 32 + p * 16;
+            out[po] = 1;
+            out[po + 1] = 127;
+            out[po + 2] = 8;
+            out[po + 4] = 64;
+            let to = 32 + 128 * 16 + p * 16 * 32;
+            out[to] = 8;
+            out[to + 1] = mode;
+            out[to + 2] = 127;
+            out[to + 3] = 64;
+            out[to + 4] = 60;
+            out[to + 7] = 127;
+            out[to + 16..to + 18].copy_from_slice(&0x00FFu16.to_le_bytes());
+            out[to + 18..to + 20].copy_from_slice(&0x000Fu16.to_le_bytes());
+            out[to + 20..to + 22].copy_from_slice(&(p as i16).to_le_bytes());
+            out[to + 22..to + 24].copy_from_slice(&1i16.to_le_bytes());
+        }
+        let sizes_off = 32 + 128 * 16 + (progs as usize) * 16 * 32;
+        out[sizes_off + 2..sizes_off + 4]
+            .copy_from_slice(&((bodies.len() / 8) as u16).to_le_bytes());
+        out[table_bytes..].copy_from_slice(&bodies);
+        VabBank::parse_vab(&out).unwrap()
+    }
+
+    #[test]
+    fn ppqn_48_matches_ppqn_120_wall_clock_speed() {
+        // One quarter note at PPQN 48 (delta 48) vs PPQN 120 (delta 120) must render
+        // the exact same number of frames!
+        let track_48: &[u8] = &[0x00, 0xC7, 0xFF, 0xC9, 0x80, 60, 127, 48, 0xCB, 0xFF, 0x00];
+        let track_120: &[u8] = &[0x00, 0xC7, 0xFF, 0xC9, 0x80, 60, 127, 120, 0xCB, 0xFF, 0x00];
+        let bank = build_vab(&[0]);
+        let cfg = RenderConfig {
+            target_loops: 0,
+            tail_seconds: 0.0,
+            max_seconds: 5.0,
+            ..RenderConfig::bgm_default()
+        };
+        let mut p48 = KdtPlayer::new(build_kdt(48, &[track_48]), bank.clone(), cfg).unwrap();
+        let mut p120 = KdtPlayer::new(build_kdt(120, &[track_120]), bank, cfg).unwrap();
+        let r48 = p48.render_all().unwrap();
+        let r120 = p120.render_all().unwrap();
+        assert_eq!(r48.frames_rendered, r120.frames_rendered);
+        assert!(r48.frames_rendered > 0);
+    }
+
+    #[test]
+    fn nrpn_finite_loop_repeats_exact_count_then_continues() {
+        // Loop Start (CC99=0x14), Loop Count (CC6=2 -> 2 repeats = 3 total passes),
+        // Note 60 (delta 20), RunningNoteOff, Loop End (CC99=0x1E), Note 72 (delta 20), EOT.
+        let looped: &[u8] = &[
+            0x00, 0xC7, 0xFF, 0xC9, 0x80, // tempo 256, prog 0
+            0xE3, 0x94, // CC 99 = 0x14 (Loop Start), zero-delta
+            0x86, 0x82, // CC 6 = 2 (2 finite repeats), zero-delta
+            60, 127, 20, 0xCB, // NoteOn 60 delta 20, RunningNoteOff
+            0xE3, 0x9E, // CC 99 = 0x1E (Loop End), zero-delta
+            72, 127, 20, 0xCB, // Post-loop note 72 delta 20, RunningNoteOff
+            0xFF, 0x00,
+        ];
+        // Reference unrolled: 3x20 + 20 = 80 ticks at PPQN 120.
+        let unrolled: &[u8] = &[0x00, 0xC7, 0xFF, 0xC9, 0x80, 60, 127, 80, 0xCB, 0xFF, 0x00];
+        let bank = build_vab(&[0]);
+        let cfg = RenderConfig {
+            target_loops: 0,
+            tail_seconds: 0.0,
+            max_seconds: 5.0,
+            ..RenderConfig::bgm_default()
+        };
+        let mut p_loop = KdtPlayer::new(build_kdt(120, &[looped]), bank.clone(), cfg).unwrap();
+        let mut p_ref = KdtPlayer::new(build_kdt(120, &[unrolled]), bank, cfg).unwrap();
+        let r_loop = p_loop.render_all().unwrap();
+        let r_ref = p_ref.render_all().unwrap();
+        assert!(r_loop.reached_end);
+        assert_eq!(p_loop.channel_snapshot(0).unwrap().key, Some(72));
+        // Finite loop adds 1 tick per wrap jump, so duration is within a couple ticks of 80.
+        let diff = r_loop.frames_rendered.abs_diff(r_ref.frames_rendered);
+        assert!(
+            diff < 500,
+            "expected finite loop ({}) ~ unrolled ({}), diff={diff}",
+            r_loop.frames_rendered,
+            r_ref.frames_rendered
+        );
+    }
+
+    #[test]
+    fn nrpn_infinite_loop_triggers_fade_at_target_loops() {
+        // Infinite NRPN loop (CC99=0x14 without CC6 -> loop_count 0x7F).
+        let track: &[u8] = &[
+            0x00, 0xC7, 0xFF, 0xC9, 0x80, // tempo 256, prog 0
+            0xE3, 0x94, // CC 99 = 0x14 (Loop Start), zero-delta
+            60, 127, 40, 0xCB, // NoteOn 60 delta 40, RunningNoteOff
+            0xE3, 0x9E, // CC 99 = 0x1E (Loop End), zero-delta
+            0xFF, 0x00,
+        ];
+        let bank = build_vab(&[0]);
+        let cfg = RenderConfig {
+            target_loops: 2,
+            fade_seconds: 0.2,
+            tail_seconds: 0.02,
+            max_seconds: 5.0,
+            ..RenderConfig::bgm_default()
+        };
+        let mut player = KdtPlayer::new(build_kdt(120, &[track]), bank, cfg).unwrap();
+        let res = player.render_all().unwrap();
+        assert!(res.faded_out);
+        assert!(res.loops_completed >= 2);
+        assert_eq!(player.sequence_volume(), 0);
+        assert!(player.is_finished());
+    }
+
+    #[test]
+    fn tempo_0x47_updates_all_tracks_and_default_is_0x68() {
+        // Track 0 sets tempo to 256; Track 1 has no tempo command and must inherit 256.
+        let t0: &[u8] = &[0x00, 0xC7, 0xFF, 0xC9, 0x80, 60, 127, 10, 0xCB, 0xFF, 0x00];
+        let t1: &[u8] = &[0x00, 0xC9, 0x80, 64, 127, 40, 0xCB, 0xFF, 0x00];
+        let bank = build_vab(&[0]);
+        let cfg = RenderConfig {
+            target_loops: 0,
+            tail_seconds: 0.0,
+            max_seconds: 5.0,
+            ..RenderConfig::bgm_default()
+        };
+        let mut player = KdtPlayer::new(build_kdt(120, &[t0, t1]), bank, cfg).unwrap();
+        assert_eq!(player.tracks[0].tempo, 0x68);
+        assert_eq!(player.tracks[1].tempo, 0x68);
+        let mut buf = [0i16; 1024];
+        let _ = player.render_samples(&mut buf).unwrap();
+        assert_eq!(player.tracks[0].tempo, 256);
+        assert_eq!(player.tracks[1].tempo, 256);
+    }
+
+    #[test]
+    fn pitch_bend_0x48_updates_active_voice_pitch() {
+        // Play note 60 (center 60 -> pitch 0x1000), then bend up to 96 (+1 semitone -> 0x10F4).
+        let track: &[u8] = &[
+            0x00, 0xC7, 0xFF, 0xC9, 0x80, // tempo 256, prog 0
+            60, 127, 20, // NoteOn 60, delta 20
+            0xC8, 96, 20, // PitchBend(96 = +1 semitone), delta 20
+            0xCB, 0xFF, 0x00,
+        ];
+        let bank = build_vab(&[0]);
+        let cfg = RenderConfig {
+            target_loops: 0,
+            tail_seconds: 0.0,
+            max_seconds: 5.0,
+            ..RenderConfig::bgm_default()
+        };
+        let mut player = KdtPlayer::new(build_kdt(120, &[track]), bank, cfg).unwrap();
+        // Step just enough for NoteOn before PitchBend.
+        let mut buf = [0i16; 512];
+        let _ = player.render_samples(&mut buf).unwrap();
+        assert_eq!(player.channel_snapshot(0).unwrap().pitch_bend, 64);
+        assert_eq!(player.channel_snapshot(0).unwrap().pitch, 0x1000);
+        // Step past delta 20 to execute PitchBend(96).
+        let mut buf2 = [0i16; 4096];
+        let _ = player.render_samples(&mut buf2).unwrap();
+        assert_eq!(player.channel_snapshot(0).unwrap().pitch_bend, 96);
+        assert_eq!(player.channel_snapshot(0).unwrap().pitch, 0x10F4);
+    }
+
+    #[test]
+    fn eon_bit_clears_when_voice_reused_for_dry_note() {
+        // Program 0 has reverb send (0x04), Program 1 is dry (0x00).
+        // Fill all 24 hardware voices with reverb notes, release voice 0, then trigger
+        // a dry note which must reuse voice 0 and clear bit 0 in EON_LO.
+        let mut track = vec![0x00, 0xC7, 0xFF, 0xC9, 0x80]; // tempo 256, prog 0 (reverb)
+        for i in 0..24u8 {
+            // 24 distinct notes (keys 48..72), zero-delta except after the 24th.
+            if i < 23 {
+                track.extend_from_slice(&[48 + i, 0xFF]); // vel 127, zero-delta
+            } else {
+                track.extend_from_slice(&[48 + i, 127, 10]); // vel 127, delta 10
+            }
+        }
+        // Explicitly release key 48 (voice 0), switch to prog 1 (dry), play key 60.
+        track.extend_from_slice(&[48, 0x80, 0xC9, 0x81, 60, 127, 40, 0xCB, 0xFF, 0x00]);
+        let bank = build_vab(&[TONE_MODE_REVERB, 0x00]);
+        let cfg = RenderConfig {
+            target_loops: 0,
+            tail_seconds: 0.0,
+            max_seconds: 5.0,
+            reverb_preset: ReverbPreset::Room,
+            ..RenderConfig::bgm_default()
+        };
+        let mut player = KdtPlayer::new(build_kdt(120, &[&track]), bank, cfg).unwrap();
+        let mut buf = [0i16; 512];
+        let _ = player.render_samples(&mut buf).unwrap();
+        assert_eq!(
+            player.device().read_ps1_register(ps1::EON_LO).unwrap(),
+            0xFFFF
+        );
+        assert_eq!(
+            player.device().read_ps1_register(ps1::EON_HI).unwrap(),
+            0x00FF
+        );
+        let mut buf2 = [0i16; 4096];
+        let _ = player.render_samples(&mut buf2).unwrap();
+        assert_eq!(
+            player.device().read_ps1_register(ps1::EON_LO).unwrap(),
+            0xFFFE
+        );
+    }
+
+    #[test]
+    fn custom_timer_divider_scales_playback_rate() {
+        let track: &[u8] = &[0x00, 0xC7, 0xFF, 0xC9, 0x80, 60, 127, 120, 0xCB, 0xFF, 0x00];
+        let bank = build_vab(&[0]);
+        let mut cfg_std = RenderConfig {
+            target_loops: 0,
+            tail_seconds: 0.0,
+            max_seconds: 5.0,
+            ..RenderConfig::bgm_default()
+        };
+        let mut cfg_fast = cfg_std;
+        cfg_fast.timer_divider = 0x1C00; // 7168 (< 7328 => faster ticks => fewer frames)
+        let r_std = KdtPlayer::new(build_kdt(120, &[track]), bank.clone(), cfg_std)
+            .unwrap()
+            .render_all()
+            .unwrap();
+        let r_fast = KdtPlayer::new(build_kdt(120, &[track]), bank.clone(), cfg_fast)
+            .unwrap()
+            .render_all()
+            .unwrap();
+        assert!(r_fast.frames_rendered < r_std.frames_rendered);
+        cfg_std.timer_divider = 0;
+        assert!(KdtPlayer::new(build_kdt(120, &[track]), bank, cfg_std).is_err());
+    }
+
+    #[test]
+    fn fixed_point_voice_volumes_boundaries() {
+        let tone = ToneAttr {
+            priority: 8,
+            mode: 0,
+            volume: 127,
+            pan: 64,
+            center: 60,
+            shift: 0,
+            min: 0,
+            max: 127,
+            adsr1: 0,
+            adsr2: 0,
+            program: 0,
+            vag: 1,
+        };
+        let ch = ChannelState::default();
+        // Full volume, center pan (64): PAN_SIN_LUT[63]=93, PAN_SIN_LUT[64]=95.
+        let (l, r) = voice_volumes(127, &tone, 127, 64, 127, ch, 127 << 16);
+        assert!(l > 11_000 && l < 13_000);
+        assert!(r > 11_000 && r < 13_000);
+        // Zero sequence volume -> silence.
+        assert_eq!(voice_volumes(127, &tone, 127, 64, 127, ch, 0), (0, 0));
+        // Hard left pan (0) -> right is 0, left is full 16383.
+        let mut left_ch = ch;
+        left_ch.pan = 0;
+        assert_eq!(
+            voice_volumes(127, &tone, 127, 64, 127, left_ch, 127 << 16),
+            (16_383, 0)
+        );
+    }
 }
